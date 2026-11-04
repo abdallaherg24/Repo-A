@@ -12,7 +12,7 @@ on:
 env:
   MY_NAME: vps-a
   PEER_NAME: vps-b
-  PEER_REPO: galaljiu86-sudo/Repo-B
+  PEER_REPO: abdallaherg24-sudo/Repo-B
   PEER_BRANCH: main
   START_CMD: "bash start.sh"
   HANDOFF_MIN: "300"
