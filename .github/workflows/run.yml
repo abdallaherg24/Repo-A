@@ -96,8 +96,13 @@ jobs:
           cd "$HOME/bgutil/server" || exit 0
           npm ci --silent && npx tsc || exit 0
           setsid nohup node build/main.js > "$HOME/bgutil.log" 2>&1 &
-          sleep 4
-          curl -s --max-time 5 http://127.0.0.1:4416/ping || echo "bgutil لم يبدأ"
+          for i in $(seq 1 15); do
+            if curl -s --max-time 2 http://127.0.0.1:4416/ping > /dev/null; then
+              echo "bgutil جاهز على المنفذ 4416"
+              break
+            fi
+            sleep 1
+          done
 
       - name: اتصل بشبكة Tailscale
         uses: tailscale/github-action@v3
@@ -119,6 +124,8 @@ jobs:
           CF_KV_ID: ${{ secrets.CF_KV_ID }}
           PAT: ${{ secrets.PAT }}
           DIRECT_LANE: "1"
+          CONCURRENT_FRAGMENTS: "64"
+          POT_BASE_URL: "http://127.0.0.1:4416"
         run: |
           set +e   # بنتعامل مع الأخطاء يدوياً حتى لا تنتهي الخطوة فجأة
           export PATH="$HOME/.local/bin:$PATH"
