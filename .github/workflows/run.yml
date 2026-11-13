@@ -126,18 +126,28 @@ jobs:
           DIRECT_LANE: "1"
           CONCURRENT_FRAGMENTS: "64"
           POT_BASE_URL: "http://127.0.0.1:4416"
+          YT_DLP_POT_PROVIDER_URL: "http://127.0.0.1:4416"
         run: |
           set +e   # بنتعامل مع الأخطاء يدوياً حتى لا تنتهي الخطوة فجأة
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.deno/bin:$HOME/.local/bin:$PATH"
           mkdir -p data
           elapsed() { echo $(( $(date +%s) - JOB_START )); }
           health() { curl -s --max-time 5 http://127.0.0.1:8090/api/health; }
+
+          ensure_bgutil() {
+            if ! curl -s --max-time 2 http://127.0.0.1:4416/ping > /dev/null; then
+              echo "تشغيل خادم bgutil..."
+              cd "$HOME/bgutil/server" 2>/dev/null && setsid nohup node build/main.js > "$HOME/bgutil.log" 2>&1 &
+              sleep 3
+            fi
+          }
 
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb > /dev/null 2>&1; rm -f cloudflared.deb
           cloudflared --version
 
           start_service() {
+            ensure_bgutil
             pkill -f "$START_CMD" 2>/dev/null
             setsid nohup $START_CMD > out.log 2>&1 &
             for i in $(seq 1 30); do
