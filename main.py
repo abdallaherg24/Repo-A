@@ -10,9 +10,17 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
+
+# ضمان وجود Deno و local bin في PATH
+os.environ["PATH"] = (
+    os.path.expanduser("~/.deno/bin") + os.pathsep +
+    os.path.expanduser("~/.local/bin") + os.pathsep +
+    os.environ.get("PATH", "")
+)
 
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -47,13 +55,15 @@ PREFLIGHT_URL = os.environ.get("PREFLIGHT_URL", "https://www.youtube.com/watch?v
 SPEED_URL = "https://speed.cloudflare.com/__down?bytes=100000000"
 COOKIE_NAME = "uid"
 POT_BASE_URL = os.environ.get("POT_BASE_URL", "http://127.0.0.1:4416")
+os.environ["YT_DLP_POT_PROVIDER_URL"] = POT_BASE_URL
+YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
 
 # ترتيب عملاء يوتيوب المتوافقة مع bgutil PO Token والمسار المباشر السريع (1 Gbps)
 YT_CLIENT_SETS = [
-    ["--extractor-args", "youtube:player_client=mweb,web,web_safari"],
-    ["--extractor-args", "youtube:player_client=web_safari,mweb"],
-    ["--extractor-args", "youtube:player_client=android_vr,web_safari"],
-    ["--extractor-args", "youtube:player_client=tv,web_safari,mweb"],
+    ["--extractor-args", "youtube:player_client=mweb,web"],
+    ["--extractor-args", "youtube:player_client=web,mweb"],
+    ["--extractor-args", "youtube:player_client=mweb,tv"],
+    ["--extractor-args", "youtube:player_client=tv,mweb"],
     ["--extractor-args", "youtube:player_client=default"],
 ]
 
@@ -211,7 +221,7 @@ def err_text(lines):
 # ----------------------------------------------------------------- الشبكة
 def net_args():
     # إعدادات الشبكة ومحاكاة المتصفح والـ PO Token ومحرك Deno
-    a = ["--socket-timeout", "30", "--retries", "10", "--force-ipv4"]
+    a = ["--socket-timeout", "30", "--retries", "10", "--fragment-retries", "10", "--force-ipv4"]
     try:
         import curl_cffi  # noqa: F401
         a += ["--impersonate", "chrome"]
@@ -224,8 +234,11 @@ def net_args():
     elif shutil.which("node"):
         a += ["--js-runtimes", "node"]
 
-    # ربط yt-dlp بخادم bgutil PO Token
-    a += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_BASE_URL}"]
+    # ربط yt-dlp بمزود PO Token وإجباره على طلب التوكن دائماً لتفادي حظر الداتاسنتر
+    a += [
+        "--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_BASE_URL}",
+        "--extractor-args", "youtube:fetch_pot=always",
+    ]
     return a
 
 def is_blocked(text):
@@ -255,7 +268,7 @@ def fatal_message(text):
 def probe_youtube():
     last = ""
     for idx, extra in enumerate(YT_CLIENT_SETS):
-        cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-warnings", "--print", "%(title)s"]
+        cmd = YTDLP_CMD + ["--ignore-config", "--no-playlist", "--no-warnings", "--print", "%(title)s"]
         cmd += net_args() + extra + ["--", PREFLIGHT_URL]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -286,7 +299,7 @@ def check_lane(l):
 
 def lane_monitor():
     try:
-        r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=20)
+        r = subprocess.run(YTDLP_CMD + ["--version"], capture_output=True, text=True, timeout=20)
         state["ytdlp"] = r.stdout.strip()
     except Exception:
         state["ytdlp"] = "?"
@@ -380,16 +393,17 @@ def ytdlp_download(job_id, data, lane, ctx):
     out_tpl = os.path.join(DOWNLOAD_DIR, f"video_{job_id}.%(ext)s")
     
     # إعدادات السرعة القصوى (700-1000 Mbps) مع التوازي والـ Buffer بدون sleep-requests
-    cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--newline", "--no-colors", "--no-mtime",
-           "-N", FRAGMENTS,
-           "--buffer-size", "16M",
-           "--http-chunk-size", "10M",
-           "--fragment-retries", "10",
-           "--retries", "10",
-           "--file-access-retries", "5",
-           "--no-resize-buffer",
-           "--postprocessor-args", "Merger:-c copy",
-           "--print-to-file", "%(title)s", title_file]
+    cmd = YTDLP_CMD + [
+        "--ignore-config", "--no-playlist", "--newline", "--no-colors", "--no-mtime",
+        "-N", FRAGMENTS,
+        "--buffer-size", "16M",
+        "--http-chunk-size", "10M",
+        "--fragment-retries", "10",
+        "--retries", "10",
+        "--file-access-retries", "5",
+        "--no-resize-buffer",
+        "--postprocessor-args", "Merger:-c copy",
+        "--print-to-file", "%(title)s", title_file]
     cmd += net_args() + client_args(lane, ctx["shift"])
     cmd += format_args(data["quality"], data["audio_only"])
     
@@ -448,7 +462,7 @@ def seg_ext(data, src_ext="mp4"):
 
 def segment_fast(job_id, data, lane, ctx):
     q = "1080" if data["quality"] == "best" else data["quality"]
-    cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-warnings", "-j"]
+    cmd = YTDLP_CMD + ["--ignore-config", "--no-playlist", "--no-warnings", "-j"]
     cmd += net_args() + client_args(lane, ctx["shift"])
     cmd += format_args(q, data["audio_only"]) + ["--", data["url"]]
     update_job(job_id, phase="جاري تحليل الرابط", progress="0%")
