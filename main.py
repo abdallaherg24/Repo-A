@@ -1,15 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 SERVANT_OF_ALLAH - محمّل فيديو مبني على yt-dlp (يعمل على GitHub Actions خلف Cloudflare Worker)
-نفس الملف في Repo-A و Repo-B.
-
-ما الجديد في هذه النسخة:
-1) مسارات شبكة متعددة (direct + WARP) مع مراقب صحة دائم: لو يوتيوب حظر مسار، السيرفر
-   يغيّر الـ IP تلقائياً ويجرّب المسار الآخر، والمهمة تنتظر IP نظيف بدل ما تفشل.
-2) السرعة: aria2c بعدة اتصالات متوازية + المواقع غير يوتيوب تنزل مباشرة بدون بروكسي.
-3) القص: يقرأ الجزء المطلوب فقط عبر HTTP Range ثم يقصه بدقة (ffmpeg ultrafast) = سريع + صوت متزامن.
-4) خصوصية: كل زائر (كوكي عشوائي) يرى تحميلاته هو فقط ولا يقدر يحذف/يحمّل ملفات غيره.
-بدون أي كوكيز يوتيوب وبدون أي خدمة مدفوعة.
+بدون بروكسي - بدون كوكيز - سرعة قصوى مع تمويه المتصفح لتجنب الحظر.
 """
 import glob
 import json
@@ -39,22 +31,15 @@ DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-PROXY = os.environ.get("YTDLP_PROXY", "").strip()           # يضبطه run.yml (WARP أو بروكسي مخصص)
-WARP_ROTATE = os.environ.get("WARP_ROTATE", "0") == "1"     # تدوير هوية WARP عند الحظر
-WARP_PORT = os.environ.get("WARP_PORT", "40000")
-DIRECT_LANE = os.environ.get("DIRECT_LANE", "1") == "1"     # مسار مباشر بدون بروكسي (أسرع ما يمكن)
-WG_NETNS = os.environ.get("WG_NETNS", "0") == "1"           # Kernel WireGuard داخل network namespace
-
-FILE_TTL = int(os.environ.get("FILE_TTL", "1200"))          # الملف يُحذف بعد 20 دقيقة من اكتماله
+FILE_TTL = int(os.environ.get("FILE_TTL", "1200"))          # الملف يُحذف بعد 20 دقيقة
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "4"))     # عدد المهام المتوازية
-MAX_ENCODES = int(os.environ.get("MAX_ENCODES", "2"))       # عمليات الترميز (قص) المتوازية
+MAX_ENCODES = int(os.environ.get("MAX_ENCODES", "2"))       # عمليات الترميز المتوازية
 MAX_USER_ACTIVE = int(os.environ.get("MAX_USER_ACTIVE", "3"))
 MAX_USER_JOBS = int(os.environ.get("MAX_USER_JOBS", "30"))
-FRAGMENTS = os.environ.get("CONCURRENT_FRAGMENTS", "16")    # للبث المباشر/المقاطع المجزأة
-ARIA_CONN = os.environ.get("ARIA_CONN", "8")                # اتصالات aria2c لكل ملف
+FRAGMENTS = os.environ.get("CONCURRENT_FRAGMENTS", "4")     # 4 أجزاء فقط لتجنب الحظر
 ENC_PRESET = os.environ.get("ENC_PRESET", "ultrafast")
 ENC_CRF = os.environ.get("ENC_CRF", "21")
-WAIT_CLEAN_SEC = int(os.environ.get("WAIT_CLEAN_SEC", "600"))  # أقصى انتظار لمسار نظيف
+WAIT_CLEAN_SEC = int(os.environ.get("WAIT_CLEAN_SEC", "600"))
 BAD_RECHECK_SEC = int(os.environ.get("BAD_RECHECK_SEC", "30"))
 OK_RECHECK_SEC = int(os.environ.get("OK_RECHECK_SEC", "300"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "8"))
@@ -62,32 +47,29 @@ PREFLIGHT_URL = os.environ.get("PREFLIGHT_URL", "https://www.youtube.com/watch?v
 SPEED_URL = "https://speed.cloudflare.com/__down?bytes=100000000"
 COOKIE_NAME = "uid"
 
-# مجموعات عملاء يوتيوب (نبدأ بالافتراضي ثم بدائل)
+# أهم تعديل: استخدام عملاء التلفزيون والويب المدمج (أقل حظراً)
 YT_CLIENT_SETS = [
-    [],
-    ["--extractor-args", "youtube:player_client=tv_downgraded,web_safari,mweb"],
-    ["--extractor-args", "youtube:player_client=android_vr,visionos,ios"],
+    ["--extractor-args", "youtube:player_client=tv,web_embedded;player_skip=webpage"],
+    ["--extractor-args", "youtube:player_client=android_vr,web_safari;player_skip=webpage"],
+    ["--extractor-args", "youtube:player_client=mweb"],
 ]
 
 # ----------------------------------------------------------------- الحالة
 jobs = {}
-jobs_lock = threading.RLock()       # RLock: يمنع الـ deadlock حتى لو تداخل الاستدعاء
+jobs_lock = threading.RLock()
 _file_lock = threading.Lock()
-procs = {}                          # job_id -> Popen
-stop_req = {}                       # job_id -> "save" | "cancel"
+procs = {}
+stop_req = {}
 slots = threading.BoundedSemaphore(MAX_PARALLEL)
 enc_sem = threading.BoundedSemaphore(MAX_ENCODES)
-rotate_lock = threading.Lock()
-_last_rotate = 0.0
-lanes = {}                          # name -> dict
+lanes = {}
 lanes_lock = threading.RLock()
 monitor_wake = threading.Event()
-state = {"preflight": "pending", "ytdlp": "", "pot": None, "rotations": 0}
+state = {"preflight": "pending", "ytdlp": "", "pot": None}
 
 
 def log(msg):
     print(msg, flush=True)
-
 
 # ----------------------------------------------------------------- تخزين المهام
 def save_jobs():
@@ -102,7 +84,6 @@ def save_jobs():
         except Exception as e:
             log(f"[jobs] save error: {e}")
 
-
 def load_jobs():
     data = {}
     if os.path.exists(JOBS_FILE):
@@ -113,12 +94,12 @@ def load_jobs():
             data = {}
     now = time.time()
     for jid, j in list(data.items()):
-        if not j.get("owner"):                 # مهام قديمة بلا صاحب: لا يراها أحد
+        if not j.get("owner"):
             data.pop(jid, None)
             continue
         if j.get("status") in ("queued", "running"):
             j["status"] = "failed"
-            j["error"] = "انقطع التحميل أثناء تبديل/إعادة تشغيل السيرفر. أعد المحاولة."
+            j["error"] = "انقطع التحميل أثناء تبديل السيرفر. أعد المحاولة."
             j["finished_at"] = now
         if j.get("status") == "finished":
             fn = j.get("filename")
@@ -128,7 +109,6 @@ def load_jobs():
         jobs.update(data)
     save_jobs()
 
-
 def update_job(job_id, **kw):
     with jobs_lock:
         j = jobs.get(job_id)
@@ -136,7 +116,6 @@ def update_job(job_id, **kw):
             return False
         j.update(kw)
     return True
-
 
 # ----------------------------------------------------------------- أدوات مساعدة
 def normalize_url(u):
@@ -153,10 +132,8 @@ def normalize_url(u):
         u = "https://" + u
     return u
 
-
 def is_youtube(url):
     return bool(re.search(r"(youtube\.com|youtu\.be|youtube-nocookie\.com)", url or "", re.I))
-
 
 def parse_hms(s):
     try:
@@ -170,14 +147,11 @@ def parse_hms(s):
         sec = sec * 60 + p
     return sec
 
-
 def safe_title(t):
     t = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", t or "").strip(" .")
     return re.sub(r"\s+", " ", t)[:120]
 
-
 TEMP_SUFFIX = (".part", ".ytdl", ".temp", ".tmp", ".json", ".txt", ".aria2")
-
 
 def find_output(job_id):
     best = None
@@ -192,7 +166,6 @@ def find_output(job_id):
             pass
     return best
 
-
 def remove_job_files(job_id):
     for pat in (f"video_{job_id}*", f"title_{job_id}*"):
         for p in glob.glob(os.path.join(DOWNLOAD_DIR, pat)):
@@ -201,7 +174,6 @@ def remove_job_files(job_id):
             except Exception:
                 pass
 
-
 def read_title(job_id):
     try:
         with open(os.path.join(DOWNLOAD_DIR, f"title_{job_id}.txt"), encoding="utf-8", errors="replace") as f:
@@ -209,9 +181,7 @@ def read_title(job_id):
     except Exception:
         return ""
 
-
 def run_proc(job_id, cmd, on_line=None):
-    """يشغّل أمر ويقرأ مخرجاته سطراً سطراً. قابل للإيقاف عبر stop_job."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", bufsize=1, start_new_session=True)
     procs[job_id] = proc
@@ -231,188 +201,36 @@ def run_proc(job_id, cmd, on_line=None):
         procs.pop(job_id, None)
     return proc.returncode, lines
 
-
 def err_text(lines):
     errs = [s.strip() for s in lines if s.strip().startswith("ERROR")]
     return " | ".join(errs[-3:]) or " | ".join(s.strip()[:300] for s in lines[-3:])
 
-
-# ----------------------------------------------------------------- الشبكة والمسارات (Lanes)
-def net_args(proxy):
-    a = ["--socket-timeout", "30", "--retries", "5"]
+# ----------------------------------------------------------------- الشبكة
+def net_args():
+    # --impersonate chrome: بيخلي الطلبات تبان كأنها من متصفح كروم
+    # --force-ipv4: بيمنع مشاكل شبكة جيت هاب
+    a = ["--socket-timeout", "30", "--retries", "5", "--impersonate", "chrome", "--force-ipv4"]
     if shutil.which("node"):
-        a += ["--js-runtimes", "node"]          # yt-dlp يحتاج JS runtime لتحديات يوتيوب
-    if proxy:
-        a += ["--proxy", proxy]
+        a += ["--js-runtimes", "node"]
     return a
-
-
-def curl_base(proxy, timeout):
-    cmd = ["curl", "-s", "--max-time", str(timeout)]
-    if proxy:
-        cmd += ["-x", proxy]
-    return cmd
-
-
-def curl_trace(proxy, timeout=12):
-    try:
-        out = subprocess.run(curl_base(proxy, timeout) + ["https://www.cloudflare.com/cdn-cgi/trace"],
-                             capture_output=True, text=True, timeout=timeout + 3).stdout
-    except Exception:
-        return {}
-    res = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
-    return {"warp": res.get("warp", "?"), "loc": res.get("loc", "?")}
-
-
-def speed_test(proxy):
-    """قياس سرعة تقريبي (Mbps) لمسار معين عبر ملف اختبار من Cloudflare."""
-    try:
-        out = subprocess.run(curl_base(proxy, 12) + ["-o", "/dev/null", "-w", "%{speed_download}", SPEED_URL],
-                             capture_output=True, text=True, timeout=20).stdout.strip()
-        return round(float(out) * 8 / 1e6, 1)
-    except Exception:
-        return None
-
-
-def add_lane(name, proxy, rotate=False):
-    with lanes_lock:
-        lanes[name] = {"name": name, "proxy": proxy, "rotate": rotate, "yt_ok": None, "checked": 0.0,
-                       "next_check": 0.0, "fails": 0, "mbps": None, "speed_at": 0.0,
-                       "client_idx": 0, "last_error": "", "egress": {}}
-
-
-def _warp(*args, timeout=40):
-    try:
-        r = subprocess.run(["warp-cli", "--accept-tos", *args], capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, (r.stdout + r.stderr).strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def _rotate_wg_netns(reason):
-    if not shutil.which("wgcf"):
-        return False
-    log(f"[wgcf] rotating identity ({reason})")
-    work = "/tmp/wgcf_rot"
-    shutil.rmtree(work, ignore_errors=True)
-    os.makedirs(work, exist_ok=True)
-    ok = False
-    for i in range(3):
-        r1 = subprocess.run(["wgcf", "register", "--accept-tos"], cwd=work, capture_output=True, text=True, timeout=30)
-        r2 = subprocess.run(["wgcf", "generate"], cwd=work, capture_output=True, text=True, timeout=30) if r1.returncode == 0 else None
-        if r1.returncode == 0 and r2 and r2.returncode == 0 and os.path.exists(os.path.join(work, "wgcf-profile.conf")):
-            ok = True
-            break
-        log(f"[wgcf] register failed ({i + 1}/3): {(r1.stdout + r1.stderr).strip()[:120]}")
-        time.sleep(6 * (i + 1))
-    if not ok:
-        return False
-    priv, v4, v6 = "", "", ""
-    with open(os.path.join(work, "wgcf-profile.conf"), encoding="utf-8") as f:
-        for line in f:
-            if "=" not in line:
-                continue
-            k, v = [x.strip() for x in line.split("=", 1)]
-            if k == "PrivateKey":
-                priv = v
-            elif k == "Address":
-                if ":" in v and not v6:
-                    v6 = v
-                elif "." in v and not v4:
-                    v4 = v
-    if not (priv and v4):
-        return False
-    key_file = "/tmp/wg_rot.key"
-    with open(key_file, "w", encoding="utf-8") as kf:
-        kf.write(priv)
-    os.chmod(key_file, 0o600)
-    try:
-        subprocess.run(["sudo", "ip", "netns", "exec", "warp", "wg", "set", "wg0", "private-key", key_file], check=True, timeout=15)
-        subprocess.run(["sudo", "ip", "-n", "warp", "addr", "flush", "dev", "wg0"], check=True, timeout=15)
-        subprocess.run(["sudo", "ip", "-n", "warp", "addr", "add", v4, "dev", "wg0"], check=True, timeout=15)
-        if v6:
-            subprocess.run(["sudo", "ip", "-n", "warp", "-6", "addr", "add", v6, "dev", "wg0"], timeout=15)
-        subprocess.run(["sudo", "ip", "-n", "warp", "route", "replace", "default", "dev", "wg0"], timeout=15)
-        if v6:
-            subprocess.run(["sudo", "ip", "-n", "warp", "-6", "route", "replace", "default", "dev", "wg0"], timeout=15)
-    except Exception as e:
-        log(f"[wgcf] apply error: {e}")
-        return False
-    finally:
-        try:
-            os.remove(key_file)
-        except Exception:
-            pass
-    time.sleep(2)
-    return True
-
-
-def rotate_warp_ip(reason=""):
-    """يغيّر هوية WARP (عبر wgcf netns أو warp-cli) للحصول على IP جديد."""
-    global _last_rotate
-    if not WARP_ROTATE:
-        return False
-    with rotate_lock:
-        if time.time() - _last_rotate < 25:
-            return True
-        if WG_NETNS:
-            ok = _rotate_wg_netns(reason)
-            _last_rotate = time.time()
-            if ok:
-                state["rotations"] += 1
-            return ok
-        if not shutil.which("warp-cli"):
-            return False
-        log(f"[warp] rotating identity ({reason})")
-        _warp("disconnect")
-        _warp("registration", "delete")
-        ok = False
-        for i in range(4):
-            ok, msg = _warp("registration", "new")
-            if not ok:
-                ok, msg = _warp("register")
-            if ok:
-                break
-            log(f"[warp] registration failed ({i + 1}/4): {msg[:120]}")
-            time.sleep(6 * (i + 1))
-        if not _warp("mode", "proxy")[0]:
-            _warp("set-mode", "proxy")
-        if not _warp("proxy", "port", WARP_PORT)[0]:
-            _warp("set-proxy-port", WARP_PORT)
-        _warp("connect")
-        for _ in range(25):
-            if "Connected" in _warp("status")[1]:
-                break
-            time.sleep(1)
-        _last_rotate = time.time()
-        state["rotations"] += 1
-        time.sleep(2)
-        return ok
-
 
 def is_blocked(text):
     return bool(re.search(r"confirm you.{0,3}re not a bot|HTTP Error 429|Too Many Requests|"
                           r"content isn.t available.{0,30}try again later", text or "", re.I))
 
-
 def is_format_problem(text):
     return bool(re.search(r"Requested format is not available|Only images are available|"
                           r"No video formats found|nsig extraction failed", text or "", re.I))
 
-
 FATALS = [
-    (re.compile(r"confirm your age|age[- ]restricted|age verification", re.I),
-     "الفيديو مقيّد بالعمر ويحتاج تسجيل دخول (غير ممكن بدون كوكيز)"),
-    (re.compile(r"Private video", re.I), "هذا الفيديو خاص"),
-    (re.compile(r"members[- ]only|Join this channel", re.I), "فيديو خاص بأعضاء القناة فقط"),
-    (re.compile(r"live event will begin|Premieres in|will begin in", re.I),
-     "البث/العرض الأول لم يبدأ بعد، جرّب عند بدايته"),
-    (re.compile(r"Video unavailable|has been removed|account.*terminated", re.I), "الفيديو غير متاح أو محذوف"),
-    (re.compile(r"not available in your country|blocked it in your country|geo.?restrict", re.I),
-     "الفيديو محجوب في بلد السيرفر الحالي"),
-    (re.compile(r"Unsupported URL", re.I), "الرابط غير مدعوم"),
+    (re.compile(r"confirm your age|age[- ]restricted|age verification", re.I), "الفيديو مقيّد بالعمر."),
+    (re.compile(r"Private video", re.I), "هذا الفيديو خاص."),
+    (re.compile(r"members[- ]only|Join this channel", re.I), "فيديو خاص بأعضاء القناة."),
+    (re.compile(r"live event will begin|Premieres in|will begin in", re.I), "البث لم يبدأ بعد."),
+    (re.compile(r"Video unavailable|has been removed|account.*terminated", re.I), "الفيديو غير متاح أو محذوف."),
+    (re.compile(r"not available in your country|blocked it in your country|geo.?restrict", re.I), "الفيديو محجوب في بلد السيرفر."),
+    (re.compile(r"Unsupported URL", re.I), "الرابط غير مدعوم."),
 ]
-
 
 def fatal_message(text):
     for rx, msg in FATALS:
@@ -420,13 +238,11 @@ def fatal_message(text):
             return msg
     return None
 
-
-def probe_youtube(proxy):
-    """يجرّب يوتيوب عبر مسار معين بكل مجموعات العملاء. يرجع (نجح؟، رقم المجموعة، نص الخطأ)."""
+def probe_youtube():
     last = ""
     for idx, extra in enumerate(YT_CLIENT_SETS):
         cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-warnings", "--print", "%(title)s"]
-        cmd += net_args(proxy) + extra + ["--", PREFLIGHT_URL]
+        cmd += net_args() + extra + ["--", PREFLIGHT_URL]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
@@ -440,18 +256,8 @@ def probe_youtube(proxy):
         last = r.stdout + r.stderr
     return False, 0, last
 
-
 def check_lane(l):
-    """يفحص مسار؛ لو فشل ومسار WARP يغيّر الـ IP ويعيد الفحص (حتى 3 مرات)."""
-    tries = 3 if l["rotate"] else 1
-    ok, idx, out = False, 0, ""
-    for t in range(tries):
-        ok, idx, out = probe_youtube(l["proxy"])
-        if ok:
-            break
-        log(f"[lane {l['name']}] youtube probe failed ({t + 1}/{tries}): {out.strip()[-120:]}")
-        if l["rotate"] and t < tries - 1:
-            rotate_warp_ip(f"lane {l['name']} probe failed")
+    ok, idx, out = probe_youtube()
     now = time.time()
     with lanes_lock:
         l["checked"] = now
@@ -459,35 +265,19 @@ def check_lane(l):
             l.update(yt_ok=True, client_idx=idx, last_error="", fails=0, next_check=now + OK_RECHECK_SEC)
         else:
             l["fails"] += 1
-            l.update(yt_ok=False, last_error=out.strip()[-240:],
-                     next_check=now + min(BAD_RECHECK_SEC * l["fails"], 300))
-    if ok and now - l["speed_at"] > 1800:
-        mbps = speed_test(l["proxy"])
-        with lanes_lock:
-            l["mbps"], l["speed_at"] = mbps, time.time()
-        l["egress"] = curl_trace(l["proxy"]) if l["proxy"] else {}
+            l.update(yt_ok=False, last_error=out.strip()[-240:], next_check=now + min(BAD_RECHECK_SEC * l["fails"], 300))
+    if not ok:
+        log(f"[lane] youtube probe failed: {out.strip()[-120:]}")
     return ok
 
-
-def mark_lane_bad(lane, err):
-    with lanes_lock:
-        lane["yt_ok"] = False
-        lane["checked"] = time.time()
-        lane["next_check"] = 0.0
-        lane["last_error"] = (err or "")[-240:]
-    monitor_wake.set()          # يصحّي المراقب ليغيّر الـ IP ويعيد الفحص فوراً
-
-
 def lane_monitor():
-    """مراقب دائم: يفحص المسارات دورياً ويصلح المحظور منها تلقائياً."""
     try:
         r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=20)
         state["ytdlp"] = r.stdout.strip()
     except Exception:
         state["ytdlp"] = "?"
     try:
-        r = subprocess.run(["curl", "-s", "--max-time", "4", "http://127.0.0.1:4416/ping"],
-                           capture_output=True, text=True, timeout=8)
+        r = subprocess.run(["curl", "-s", "--max-time", "4", "http://127.0.0.1:4416/ping"], capture_output=True, text=True, timeout=8)
         state["pot"] = bool(r.stdout.strip())
     except Exception:
         state["pot"] = False
@@ -512,29 +302,22 @@ def lane_monitor():
                 except Exception as e:
                     log(f"[monitor] {l['name']}: {e}")
 
-
 def lane_summary():
     with lanes_lock:
-        return [{"name": l["name"], "yt_ok": l["yt_ok"], "mbps": l["mbps"], "fails": l["fails"],
-                 "egress": l["egress"], "last_error": l["last_error"][-120:]} for l in lanes.values()]
+        return [{"name": l["name"], "yt_ok": l["yt_ok"], "fails": l["fails"], "last_error": l["last_error"][-120:]} for l in lanes.values()]
 
-
-def pick_lane(url, exclude=()):
-    """يختار أفضل مسار متاح. يرجع None لو كل مسارات يوتيوب محظورة حالياً."""
+def add_lane(name):
     with lanes_lock:
-        cand = [l for l in lanes.values() if l["name"] not in exclude]
-        if is_youtube(url):
-            good = [l for l in cand if l["yt_ok"] is True]
-            if good:
-                return max(good, key=lambda l: l["mbps"] or 0)
-            unknown = [l for l in cand if l["yt_ok"] is None]
-            return unknown[0] if unknown else None
-        for name in ("direct", "proxy"):          # المواقع الأخرى: مباشر أولاً (أسرع)
-            for l in cand:
-                if l["name"] == name:
-                    return l
-        return cand[0] if cand else None
+        lanes[name] = {"name": name, "yt_ok": None, "checked": 0.0, "next_check": 0.0, "fails": 0, "client_idx": 0, "last_error": ""}
 
+def pick_lane():
+    with lanes_lock:
+        cand = list(lanes.values())
+        good = [l for l in cand if l["yt_ok"] is True]
+        if good:
+            return good[0]
+        unknown = [l for l in cand if l["yt_ok"] is None]
+        return unknown[0] if unknown else (cand[0] if cand else None)
 
 # ----------------------------------------------------------------- بناء أوامر التحميل
 def format_args(quality, audio_only):
@@ -544,21 +327,11 @@ def format_args(quality, audio_only):
     if quality == "best":
         return ["-f", "bv*+ba/b"] + sort
     h = int(quality)
-    return ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"] + sort
-
-
-def aria_args():
-    n = ARIA_CONN
-    return ["--downloader", "aria2c", "--downloader", "dash,m3u8:native",
-            "--downloader-args", f"aria2c:-x{n} -s{n} -k1M --max-tries=5 --retry-wait=2"]
-
+    return ["-f", f"bv*[height<={h}]+ba[height<={h}]/b[height<={h}]"] + sort
 
 PCT_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 SPEED_RE = re.compile(r"at\s+(\S+/s)")
 ETA_RE = re.compile(r"ETA\s+(\S+)")
-SIZE_RE = re.compile(r"\[download\]\s+(~?\s*[\d.]+\s*\w*B)\s+at")
-ARIA_RE = re.compile(r"\((\d+)%\).*?DL:(\S+)(?:.*?ETA:(\S+))?")
-
 
 def handle_line(job_id, s):
     m = PCT_RE.search(s)
@@ -567,33 +340,16 @@ def handle_line(job_id, s):
         update_job(job_id, progress=f"{float(m.group(1)):.1f}%", phase="جاري التحميل",
                    speed=sp.group(1) if sp else "", eta=eta.group(1) if eta else "")
         return
-    m = ARIA_RE.search(s)
-    if m and s.startswith("["):
-        update_job(job_id, progress=f"{m.group(1)}%", phase="جاري التحميل", speed=m.group(2) + "/s",
-                   eta=m.group(3) or "")
-        return
-    m = SIZE_RE.search(s)
-    if m:
-        sp = SPEED_RE.search(s)
-        update_job(job_id, progress=m.group(1).replace(" ", ""), phase="جاري التسجيل/التحميل",
-                   speed=sp.group(1) if sp else "", eta="")
-        return
     if s.startswith("[Merger]") or "Merging formats" in s:
         update_job(job_id, phase="جاري دمج الصوت والصورة", speed="", eta="")
     elif s.startswith("[ExtractAudio]"):
         update_job(job_id, phase="جاري التحويل إلى mp3", speed="", eta="")
     elif s.startswith("[youtube]") or s.startswith("[info]"):
         update_job(job_id, phase="جاري تحليل الرابط")
-    elif s.startswith("[download] Destination") or s.startswith("[hlsnative]") or s.startswith("[dashsegments]"):
-        update_job(job_id, phase="جاري التحميل")
 
-
-def client_args(url, lane, shift):
-    if not is_youtube(url):
-        return []
+def client_args(lane, shift):
     idx = (lane.get("client_idx", 0) + shift) % len(YT_CLIENT_SETS)
     return YT_CLIENT_SETS[idx]
-
 
 def ytdlp_download(job_id, data, lane, ctx):
     title_file = os.path.join(DOWNLOAD_DIR, f"title_{job_id}.txt")
@@ -602,23 +358,25 @@ def ytdlp_download(job_id, data, lane, ctx):
     except Exception:
         pass
     out_tpl = os.path.join(DOWNLOAD_DIR, f"video_{job_id}.%(ext)s")
+    
+    # إضافة --sleep-requests 1 لتجنب الحظر
     cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--newline", "--no-colors", "--no-mtime",
-           "-N", FRAGMENTS, "--fragment-retries", "10", "--print-to-file", "%(title)s", title_file]
-    cmd += net_args(lane["proxy"]) + client_args(data["url"], lane, ctx["shift"])
+           "-N", FRAGMENTS, "--fragment-retries", "10", "--sleep-requests", "1",
+           "--print-to-file", "%(title)s", title_file]
+    cmd += net_args() + client_args(lane, ctx["shift"])
     cmd += format_args(data["quality"], data["audio_only"])
-    if ctx.get("aria"):
-        cmd += aria_args()
+    
+    # aria2c تم إلغاؤه تماماً للحفاظ على بصمة المتصفح
     if data.get("live_from_start"):
         cmd.append("--live-from-start")
     cmd += ["-o", out_tpl, "--", data["url"]]
+    
     rc, lines = run_proc(job_id, cmd, on_line=lambda s: handle_line(job_id, s))
     path = find_output(job_id) if rc == 0 else None
-    log(f"[job {job_id}] yt-dlp lane={lane['name']} aria={bool(ctx.get('aria'))} rc={rc} {err_text(lines)[:160]}")
-    return {"ok": bool(path), "path": path, "error": err_text(lines), "tail": lines[-14:],
-            "title": read_title(job_id)}
+    log(f"[job {job_id}] yt-dlp rc={rc} {err_text(lines)[:160]}")
+    return {"ok": bool(path), "path": path, "error": err_text(lines), "tail": lines[-14:], "title": read_title(job_id)}
 
-
-# ----------------------------------------------------------------- القص (Segment)
+# ----------------------------------------------------------------- القص
 def ffmpeg_progress_cb(job_id, dur):
     def cb(s):
         if s.startswith("out_time_us=") or s.startswith("out_time_ms="):
@@ -632,14 +390,10 @@ def ffmpeg_progress_cb(job_id, dur):
             update_job(job_id, speed=s.split("=", 1)[1].strip(), eta="")
     return cb
 
-
-def build_ffmpeg_cut(inputs, start, dur, out, precise, audio_only, proxy):
-    """inputs: [{'src':..., 'url':bool, 'headers':{}, 'kind':'v'|'a'|None}]"""
+def build_ffmpeg_cut(inputs, start, dur, out, precise, audio_only):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
     for inp in inputs:
         if inp.get("url"):
-            if proxy:
-                cmd += ["-http_proxy", proxy]
             hdr = "".join(f"{k}: {v}\r\n" for k, v in (inp.get("headers") or {}).items())
             if hdr:
                 cmd += ["-headers", hdr]
@@ -660,18 +414,15 @@ def build_ffmpeg_cut(inputs, start, dur, out, precise, audio_only, proxy):
     cmd.append(out)
     return cmd
 
-
 def seg_ext(data, src_ext="mp4"):
     if data["audio_only"]:
         return "mp3"
     return "mp4" if data.get("precise", True) else src_ext
 
-
 def segment_fast(job_id, data, lane, ctx):
-    """يقرأ الجزء المطلوب فقط من الروابط المباشرة (HTTP Range) ويقصه مباشرة."""
-    q = "1080" if data["quality"] == "best" else data["quality"]       # حد 1080 للقص لتسريع الترميز
+    q = "1080" if data["quality"] == "best" else data["quality"]
     cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--no-warnings", "-j"]
-    cmd += net_args(lane["proxy"]) + client_args(data["url"], lane, ctx["shift"])
+    cmd += net_args() + client_args(lane, ctx["shift"])
     cmd += format_args(q, data["audio_only"]) + ["--", data["url"]]
     update_job(job_id, phase="جاري تحليل الرابط", progress="0%")
     rc, lines = run_proc(job_id, cmd)
@@ -686,19 +437,21 @@ def segment_fast(job_id, data, lane, ctx):
     if info is None:
         return {"ok": False, "error": err_text(lines), "tail": lines[-14:]}
     if info.get("is_live"):
-        return {"ok": False, "fatal": "لا يمكن قص جزء من بث مباشر جارٍ؛ استخدم تحميل كامل ثم 'إيقاف وحفظ'.",
-                "error": "live", "tail": []}
+        return {"ok": False, "fatal": "لا يمكن قص جزء من بث مباشر.", "error": "live", "tail": []}
+    
     dur_total = info.get("duration")
     start, end = data["start"], data["end"]
     if dur_total:
         if start >= dur_total:
-            return {"ok": False, "fatal": "وقت البداية أكبر من مدة الفيديو.", "error": "range", "tail": []}
+            return {"ok": False, "fatal": "وقت البداية أكبر من المدة.", "error": "range", "tail": []}
         end = min(end, int(dur_total))
     dur = end - start
     fmts = info.get("requested_formats") or [info]
+    
     for f in fmts:
         if not f.get("url") or f.get("fragments") or f.get("protocol") not in ("https", "http"):
             return {"ok": False, "fallback": True, "error": "no direct urls", "tail": []}
+            
     inputs = []
     for f in fmts:
         has_v = f.get("vcodec") not in (None, "none")
@@ -708,11 +461,11 @@ def segment_fast(job_id, data, lane, ctx):
     title = safe_title(info.get("title", ""))
     with open(os.path.join(DOWNLOAD_DIR, f"title_{job_id}.txt"), "w", encoding="utf-8") as tf:
         tf.write(title + "\n")
-    ff = build_ffmpeg_cut(inputs, start, dur, out, data.get("precise", True), data["audio_only"], lane["proxy"])
+    ff = build_ffmpeg_cut(inputs, start, dur, out, data.get("precise", True), data["audio_only"])
     update_job(job_id, phase="جاري قص الجزء المطلوب", progress="0%")
     with enc_sem:
         rc, flines = run_proc(job_id, ff, on_line=ffmpeg_progress_cb(job_id, dur))
-    log(f"[job {job_id}] ffmpeg-cut lane={lane['name']} rc={rc} {err_text(flines)[:160]}")
+    log(f"[job {job_id}] ffmpeg-cut rc={rc} {err_text(flines)[:160]}")
     if rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
         return {"ok": True, "path": out, "title": title, "tail": []}
     try:
@@ -721,9 +474,7 @@ def segment_fast(job_id, data, lane, ctx):
         pass
     return {"ok": False, "fallback": True, "error": err_text(flines), "tail": flines[-14:]}
 
-
 def segment_via_full(job_id, data, lane, ctx):
-    """خطة بديلة: تحميل الفيديو كاملاً (سريع بـ aria2c) ثم قص الجزء محلياً."""
     full = dict(data, mode="full")
     if full["quality"] == "best":
         full["quality"] = "1080"
@@ -734,8 +485,7 @@ def segment_via_full(job_id, data, lane, ctx):
     out = os.path.join(DOWNLOAD_DIR, f"video_{job_id}.cut.{seg_ext(data, os.path.splitext(src)[1].lstrip('.') or 'mp4')}")
     dur = data["end"] - data["start"]
     update_job(job_id, phase="جاري قص الجزء المطلوب", progress="0%")
-    ff = build_ffmpeg_cut([{"src": src}], data["start"], dur, out, data.get("precise", True),
-                          data["audio_only"], None)
+    ff = build_ffmpeg_cut([{"src": src}], data["start"], dur, out, data.get("precise", True), data["audio_only"])
     with enc_sem:
         rc, flines = run_proc(job_id, ff, on_line=ffmpeg_progress_cb(job_id, dur))
     try:
@@ -746,51 +496,46 @@ def segment_via_full(job_id, data, lane, ctx):
         return {"ok": True, "path": out, "title": res.get("title", ""), "tail": []}
     return {"ok": False, "error": "فشل القص: " + err_text(flines), "tail": flines[-14:]}
 
-
 def full_attempt(job_id, data, lane, ctx):
     return ytdlp_download(job_id, data, lane, ctx)
-
 
 def segment_attempt(job_id, data, lane, ctx):
     res = segment_fast(job_id, data, lane, ctx)
     if res.get("fallback"):
-        log(f"[job {job_id}] fast cut unavailable -> full download + local cut")
+        log(f"[job {job_id}] fast cut unavailable -> full download")
         return segment_via_full(job_id, data, lane, ctx)
     return res
 
-
 # ----------------------------------------------------------------- حلقة المحاولات
 def attempt_loop(job_id, data, worker):
-    url = data["url"]
-    yt = is_youtube(url)
+    yt = is_youtube(data["url"])
     deadline = time.time() + WAIT_CLEAN_SEC
-    exclude = set()
-    ctx = {"shift": 0, "aria": bool(shutil.which("aria2c"))}
+    ctx = {"shift": 0}
     last_err, last_tail, n = "", [], 0
+    
     while n < MAX_ATTEMPTS:
         if stop_req.get(job_id):
             return None
-        lane = pick_lane(url, exclude)
+        lane = pick_lane()
         if lane is None:
             if yt and time.time() < deadline:
-                update_job(job_id, phase="كل المسارات محظورة مؤقتاً، جاري البحث عن IP نظيف...", speed="", eta="")
+                update_job(job_id, phase="جاري البحث عن مسار نظيف...", speed="", eta="")
                 monitor_wake.set()
                 time.sleep(4)
                 continue
-            if not yt and exclude:
-                exclude.clear()      # جرّب مرة أخرى بكل المسارات
-                n += 1
-                continue
             break
-        update_job(job_id, attempt=n + 1, lane=lane["name"], progress="0%", speed="", eta="")
+            
+        update_job(job_id, attempt=n + 1, progress="0%", speed="", eta="")
         if n > 0:
-            update_job(job_id, phase=f"إعادة المحاولة ({n + 1}) عبر مسار {lane['name']}")
+            update_job(job_id, phase=f"إعادة المحاولة ({n + 1})...")
+            
         res = worker(job_id, data, lane, ctx)
         n += 1
         if stop_req.get(job_id):
             return None
         if res.get("ok"):
             return res
+            
         err = res.get("error", "")
         last_err, last_tail = err, res.get("tail", [])
         if res.get("fatal"):
@@ -798,24 +543,19 @@ def attempt_loop(job_id, data, worker):
         fm = fatal_message(err)
         if fm:
             return {"ok": False, "error": fm, "tail": last_tail}
+            
         if is_blocked(err):
-            if yt:
-                mark_lane_bad(lane, err)
-            else:
-                exclude.add(lane["name"])
+            lane["yt_ok"] = False
+            monitor_wake.set()
         elif is_format_problem(err):
             ctx["shift"] += 1
         else:
-            ctx["aria"] = False          # جرّب المحمّل الداخلي
             ctx["shift"] += 1
-            if not yt:
-                exclude.add(lane["name"])
-        time.sleep(2)
+        time.sleep(3)
+        
     if is_blocked(last_err) or (yt and last_err == ""):
-        last_err = ("يوتيوب حظر كل المسارات المتاحة حالياً. السيرفر بيغيّر الـ IP تلقائياً "
-                    "في الخلفية، جرّب مرة أخرى بعد دقائق.")
+        last_err = "يوتيوب حظر الطلبات مؤقتاً. جرب تاني بعد دقايق."
     return {"ok": False, "error": (last_err or "فشل غير معروف")[:400], "tail": last_tail}
-
 
 # ----------------------------------------------------------------- تشغيل المهام
 def salvage_partial(job_id, audio_only):
@@ -837,7 +577,6 @@ def salvage_partial(job_id, audio_only):
         return out
     return None
 
-
 def finish_ok(job_id, path, title=None):
     title = safe_title(title) if title else read_title(job_id)
     update_job(job_id, status="finished", filename=os.path.basename(path), display_name=title,
@@ -850,12 +589,9 @@ def finish_ok(job_id, path, title=None):
                 pass
     save_jobs()
 
-
 def fail_job(job_id, msg, tail=None):
-    update_job(job_id, status="failed", error=msg, phase="فشل", speed="", eta="",
-               finished_at=time.time(), log=tail or [])
+    update_job(job_id, status="failed", error=msg, phase="فشل", speed="", eta="", finished_at=time.time(), log=tail or [])
     save_jobs()
-
 
 def run_job(job_id, data):
     try:
@@ -874,7 +610,7 @@ def run_job(job_id, data):
                 if out:
                     finish_ok(job_id, out)
                 else:
-                    fail_job(job_id, "تم الإيقاف لكن لا يوجد جزء مسجّل يمكن حفظه.")
+                    fail_job(job_id, "تم الإيقاف لكن لا يوجد جزء يمكن حفظه.")
                 return
             if res and res.get("ok"):
                 finish_ok(job_id, res["path"], res.get("title"))
@@ -896,7 +632,6 @@ def run_job(job_id, data):
             except Exception:
                 pass
 
-
 def _escalate(p):
     for sig, wait in ((signal.SIGTERM, 15), (signal.SIGKILL, 10)):
         t0 = time.time()
@@ -908,7 +643,6 @@ def _escalate(p):
             os.killpg(os.getpgid(p.pid), sig)
         except Exception:
             return
-
 
 def stop_job(job_id, mode):
     with jobs_lock:
@@ -925,7 +659,6 @@ def stop_job(job_id, mode):
             pass
         threading.Thread(target=_escalate, args=(p,), daemon=True).start()
     return True
-
 
 def cleanup_loop():
     while True:
@@ -958,8 +691,6 @@ def cleanup_loop():
             log(f"[cleanup] {e}")
         time.sleep(30)
 
-
-# ----------------------------------------------------------------- هوية الزائر (كوكي عشوائي)
 @app.before_request
 def identify_visitor():
     uid = request.cookies.get(COOKIE_NAME, "")
@@ -968,24 +699,19 @@ def identify_visitor():
     else:
         g.uid, g.new_uid = uuid.uuid4().hex, True
 
-
 @app.after_request
 def set_visitor_cookie(resp):
     if getattr(g, "new_uid", False) and request.path not in ("/api/health", "/og-image.png"):
-        https = (request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip() == "https"
-                 or bool(request.headers.get("X-Public-Host")))
-        resp.set_cookie(COOKIE_NAME, g.uid, max_age=60 * 60 * 24 * 365, httponly=True,
-                        samesite="Lax", secure=https)
+        https = (request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip() == "https" or bool(request.headers.get("X-Public-Host")))
+        resp.set_cookie(COOKIE_NAME, g.uid, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax", secure=https)
     return resp
-
 
 def owned_job(job_id):
     with jobs_lock:
         j = jobs.get(job_id)
         return j if (j and j.get("owner") == g.uid) else None
 
-
-# ----------------------------------------------------------------- الواجهة
+# ----------------------------------------------------------------- الواجهة (HTML)
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -1257,7 +983,7 @@ async function fetchJobs() {
 async function fetchStatus() {
   try {
     const h = await (await fetch('/api/health', { cache: 'no-store' })).json();
-    const parts = (h.lanes || []).map(l => l.name + (l.yt_ok === true ? ' ✓' : (l.yt_ok === false ? ' ✗' : ' …')) + (l.mbps ? ' ' + Math.round(l.mbps) + 'Mbps' : ''));
+    const parts = (h.lanes || []).map(l => l.name + (l.yt_ok === true ? ' ✓' : (l.yt_ok === false ? ' ✗' : ' …')));
     $('srv-status').textContent = parts.length ? ('YouTube: ' + parts.join(' | ')) : '';
   } catch (e) { $('srv-status').textContent = ''; }
 }
@@ -1279,8 +1005,7 @@ SVG_POSTER = """<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630
   <text x="600" y="490" text-anchor="middle" fill="#cbd5e1" font-family="sans-serif" font-size="26">shall be paid what he earned, and they shall not be dealt with unjustly.</text>
 </svg>"""
 
-
-# ----------------------------------------------------------------- المسارات (Routes)
+# ----------------------------------------------------------------- المسارات
 @app.route("/")
 def index():
     host = request.headers.get("X-Public-Host")
@@ -1289,11 +1014,9 @@ def index():
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-
 @app.route("/og-image.png")
 def og_image():
     return Response(SVG_POSTER, mimetype="image/svg+xml")
-
 
 @app.route("/api/health")
 def api_health():
@@ -1304,16 +1027,14 @@ def api_health():
         "ok": True, "running": running, "preflight": state["preflight"],
         "youtube_ok": any(l["yt_ok"] for l in lns) if lns else None,
         "lanes": lns, "ytdlp": state["ytdlp"], "pot_server": state["pot"],
-        "aria2c": bool(shutil.which("aria2c")), "warp_rotations": state["rotations"],
     })
-
 
 @app.route("/api/jobs")
 def api_jobs():
     with jobs_lock:
         items = []
         for jid, j in jobs.items():
-            if j.get("owner") != g.uid:         # كل زائر يرى تحميلاته فقط
+            if j.get("owner") != g.uid:
                 continue
             d = {k: v for k, v in j.items() if k != "owner"}
             d["id"] = jid
@@ -1322,7 +1043,6 @@ def api_jobs():
     resp = jsonify(items)
     resp.headers["Cache-Control"] = "no-store"
     return resp
-
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
@@ -1353,17 +1073,15 @@ def api_download():
         jobs[job_id] = {"owner": g.uid, "url": url, "status": "queued", "phase": "في قائمة الانتظار",
                         "progress": "0%", "speed": "", "eta": "", "filename": "", "display_name": "",
                         "error": "", "created": time.time(), "mode": mode}
-    save_jobs()       # خارج القفل
+    save_jobs()
     threading.Thread(target=run_job, args=(job_id, opts), daemon=True).start()
     return jsonify({"job_id": job_id})
-
 
 @app.route("/api/stop/<job_id>", methods=["POST"])
 def api_stop(job_id):
     if not owned_job(job_id):
         return jsonify({"status": "not_found"}), 404
     return jsonify({"status": "ok" if stop_job(job_id, "save") else "not_running"})
-
 
 @app.route("/api/delete/<job_id>", methods=["POST"])
 def api_delete(job_id):
@@ -1376,7 +1094,6 @@ def api_delete(job_id):
     save_jobs()
     return jsonify({"status": "ok"})
 
-
 @app.route("/downloads/<path:filename>")
 def serve_file(filename):
     name = None
@@ -1386,31 +1103,24 @@ def serve_file(filename):
                 name = j.get("display_name") or ""
                 break
         else:
-            return jsonify({"error": "غير موجود"}), 404       # ملف شخص آخر أو منتهي
+            return jsonify({"error": "غير موجود"}), 404
     kw = {"as_attachment": True}
     if name:
         kw["download_name"] = name + os.path.splitext(filename)[1]
     return send_from_directory(DOWNLOAD_DIR, filename, **kw)
 
-
 # ----------------------------------------------------------------- التشغيل
 def main():
     load_jobs()
-    if DIRECT_LANE:
-        add_lane("direct", "")
-    if PROXY:
-        add_lane("proxy", PROXY, rotate=WARP_ROTATE)
-    if not lanes:
-        add_lane("direct", "")
+    add_lane("direct")
     threading.Thread(target=cleanup_loop, daemon=True).start()
     threading.Thread(target=lane_monitor, daemon=True).start()
-    log(f"[server] 127.0.0.1:{PORT} lanes={list(lanes)} warp_rotate={WARP_ROTATE} wg_netns={WG_NETNS} aria2c={bool(shutil.which('aria2c'))}")
+    log(f"[server] 127.0.0.1:{PORT} direct_lane_only=True")
     try:
         from waitress import serve
         serve(app, host="127.0.0.1", port=PORT, threads=48, channel_timeout=600)
     except ImportError:
         app.run(host="127.0.0.1", port=PORT, threaded=True)
-
 
 if __name__ == "__main__":
     main()
