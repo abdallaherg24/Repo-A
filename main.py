@@ -36,7 +36,7 @@ MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "4"))     # عدد المها�
 MAX_ENCODES = int(os.environ.get("MAX_ENCODES", "2"))       # عمليات الترميز المتوازية
 MAX_USER_ACTIVE = int(os.environ.get("MAX_USER_ACTIVE", "3"))
 MAX_USER_JOBS = int(os.environ.get("MAX_USER_JOBS", "30"))
-FRAGMENTS = os.environ.get("CONCURRENT_FRAGMENTS", "4")     # 4 أجزاء فقط لتجنب الحظر
+FRAGMENTS = os.environ.get("CONCURRENT_FRAGMENTS", "64")     # سرعة قصوى (64-128 جزء متوازي لتشبع 1 Gbps)
 ENC_PRESET = os.environ.get("ENC_PRESET", "ultrafast")
 ENC_CRF = os.environ.get("ENC_CRF", "21")
 WAIT_CLEAN_SEC = int(os.environ.get("WAIT_CLEAN_SEC", "600"))
@@ -46,12 +46,15 @@ MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "8"))
 PREFLIGHT_URL = os.environ.get("PREFLIGHT_URL", "https://www.youtube.com/watch?v=jNQXAC9IVRw")
 SPEED_URL = "https://speed.cloudflare.com/__down?bytes=100000000"
 COOKIE_NAME = "uid"
+POT_BASE_URL = os.environ.get("POT_BASE_URL", "http://127.0.0.1:4416")
 
-# أهم تعديل: استخدام عملاء التلفزيون والويب المدمج (أقل حظراً)
+# ترتيب عملاء يوتيوب المتوافقة مع bgutil PO Token والمسار المباشر السريع (1 Gbps)
 YT_CLIENT_SETS = [
-    ["--extractor-args", "youtube:player_client=tv,web_embedded;player_skip=webpage"],
-    ["--extractor-args", "youtube:player_client=android_vr,web_safari;player_skip=webpage"],
-    ["--extractor-args", "youtube:player_client=mweb"],
+    ["--extractor-args", "youtube:player_client=mweb,web,web_safari"],
+    ["--extractor-args", "youtube:player_client=web_safari,mweb"],
+    ["--extractor-args", "youtube:player_client=android_vr,web_safari"],
+    ["--extractor-args", "youtube:player_client=tv,web_safari,mweb"],
+    ["--extractor-args", "youtube:player_client=default"],
 ]
 
 # ----------------------------------------------------------------- الحالة
@@ -207,11 +210,22 @@ def err_text(lines):
 
 # ----------------------------------------------------------------- الشبكة
 def net_args():
-    # --impersonate chrome: بيخلي الطلبات تبان كأنها من متصفح كروم
-    # --force-ipv4: بيمنع مشاكل شبكة جيت هاب
-    a = ["--socket-timeout", "30", "--retries", "5", "--impersonate", "chrome", "--force-ipv4"]
-    if shutil.which("node"):
+    # إعدادات الشبكة ومحاكاة المتصفح والـ PO Token ومحرك Deno
+    a = ["--socket-timeout", "30", "--retries", "10", "--force-ipv4"]
+    try:
+        import curl_cffi  # noqa: F401
+        a += ["--impersonate", "chrome"]
+    except Exception:
+        pass
+
+    # تفضيل Deno كأسرع محرك لتحديات يوتيوب EJS ثم Node
+    if shutil.which("deno"):
+        a += ["--js-runtimes", "deno"]
+    elif shutil.which("node"):
         a += ["--js-runtimes", "node"]
+
+    # ربط yt-dlp بخادم bgutil PO Token
+    a += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_BASE_URL}"]
     return a
 
 def is_blocked(text):
@@ -276,10 +290,16 @@ def lane_monitor():
         state["ytdlp"] = r.stdout.strip()
     except Exception:
         state["ytdlp"] = "?"
-    try:
-        r = subprocess.run(["curl", "-s", "--max-time", "4", "http://127.0.0.1:4416/ping"], capture_output=True, text=True, timeout=8)
-        state["pot"] = bool(r.stdout.strip())
-    except Exception:
+    for _ in range(5):
+        try:
+            r = subprocess.run(["curl", "-s", "--max-time", "3", f"{POT_BASE_URL}/ping"], capture_output=True, text=True, timeout=5)
+            if r.stdout.strip():
+                state["pot"] = True
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
         state["pot"] = False
 
     state["preflight"] = "running"
@@ -359,9 +379,16 @@ def ytdlp_download(job_id, data, lane, ctx):
         pass
     out_tpl = os.path.join(DOWNLOAD_DIR, f"video_{job_id}.%(ext)s")
     
-    # إضافة --sleep-requests 1 لتجنب الحظر
+    # إعدادات السرعة القصوى (700-1000 Mbps) مع التوازي والـ Buffer بدون sleep-requests
     cmd = ["yt-dlp", "--ignore-config", "--no-playlist", "--newline", "--no-colors", "--no-mtime",
-           "-N", FRAGMENTS, "--fragment-retries", "10", "--sleep-requests", "1",
+           "-N", FRAGMENTS,
+           "--buffer-size", "16M",
+           "--http-chunk-size", "10M",
+           "--fragment-retries", "10",
+           "--retries", "10",
+           "--file-access-retries", "5",
+           "--no-resize-buffer",
+           "--postprocessor-args", "Merger:-c copy",
            "--print-to-file", "%(title)s", title_file]
     cmd += net_args() + client_args(lane, ctx["shift"])
     cmd += format_args(data["quality"], data["audio_only"])
@@ -547,11 +574,8 @@ def attempt_loop(job_id, data, worker):
         if is_blocked(err):
             lane["yt_ok"] = False
             monitor_wake.set()
-        elif is_format_problem(err):
-            ctx["shift"] += 1
-        else:
-            ctx["shift"] += 1
-        time.sleep(3)
+        ctx["shift"] += 1
+        time.sleep(2)
         
     if is_blocked(last_err) or (yt and last_err == ""):
         last_err = "يوتيوب حظر الطلبات مؤقتاً. جرب تاني بعد دقايق."
@@ -579,8 +603,10 @@ def salvage_partial(job_id, audio_only):
 
 def finish_ok(job_id, path, title=None):
     title = safe_title(title) if title else read_title(job_id)
+    with jobs_lock:
+        last_sp = jobs.get(job_id, {}).get("speed", "")
     update_job(job_id, status="finished", filename=os.path.basename(path), display_name=title,
-               progress="100%", phase="تم", speed="", eta="", finished_at=time.time(), error="", log=[])
+               progress="100%", phase="تم", speed=last_sp, eta="", finished_at=time.time(), error="", log=[])
     for p in glob.glob(os.path.join(DOWNLOAD_DIR, f"video_{job_id}*")):
         if os.path.abspath(p) != os.path.abspath(path):
             try:
